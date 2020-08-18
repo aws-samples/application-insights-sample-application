@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  SQLServerAmi:
+    Type: String
+    Default: ami-0001fe9c3fadd96f5
+  DotNETAmi:
+    Type: String
+    Default: ami-05b4eaa856c6571fa
+  SQLServerInstanceType:
+    Type: String
+    Default: m5.large
+  DotNETInstanceType:
+    Type: String
+    Default: t3.medium
+  SQLUser:
+    Description: Username for the SQL Server account
+    Type: String
+    Default: example_customer
+    MaxLength: 25
+    MinLength: 5
+  SQLUserPassword:
+    Description: Password for the SQL Server account. Must follow SQL Database password complexity policies.
+    NoEcho: true
+    Type: String
+    MaxLength: 128
+    MinLength: 8
+  EC2KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair. If no key pair exists, create one in the EC2 console.
+  DefaultRDPIngress:
+    Type: String
+    Description: IP address for security group ingress. Default to 0.0.0.0/0 (open to public)
+    Default: 0.0.0.0/0
+
+Resources:
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - Ref: AdventureWorksSubnet1
+        - Ref: AdventureWorksSubnet2
+      SecurityGroups:
+        - Ref: WebServerSecurityGroup
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: ALBTargetGroup
+      LoadBalancerArn:
+        Ref: ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Ref: AdventureWorksVpc
+
+  ### SQL Server DB Instance ###
+  ServerInstance:
+    DependsOn: AdventureWorksVpcGatewayAttachment
+    Type: AWS::EC2::Instance
+    Properties:
+      KeyName:
+        Ref: EC2KeyName
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      ImageId:
+        Ref: SQLServerAmi
+      InstanceType:
+        Ref: SQLServerInstanceType
+      Monitoring: true
+      SecurityGroupIds:
+        - Fn::GetAtt: SQLServerSecurityGroup.GroupId
+      SubnetId:
+        Ref: AdventureWorksSubnet1
+      # Powershell script to fetch user credentials from secrets manager, and configure database with these credentials.
+      UserData: !Base64
+        Fn::Sub: |
+          <powershell>
+          $SQLSecrets = Get-SECSecretValue -SecretId ${SQLSecrets}
+
+          $secret = $SQLSecrets.SecretString | ConvertFrom-Json
+          $username = $secret.username
+          $password = $secret.password
+
+          Invoke-Sqlcmd -Query "ALTER LOGIN example_customer WITH NAME = $username"
+          Invoke-Sqlcmd -Query "ALTER LOGIN $username WITH PASSWORD = '$password'"
+          </powershell>
+
+  ### .NET application instance ###
+  DotNETAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - Ref: AdventureWorksSubnet1
+        - Ref: AdventureWorksSubnet2
+      LaunchConfigurationName:
+        Ref: DotNetLaunchConfig
+      MinSize: 2
+      MaxSize: 4
+      TargetGroupARNs:
+        - Ref: ALBTargetGroup
+
+  DotNetLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      KeyName:
+        Ref: EC2KeyName
+      ImageId:
+        Ref: DotNETAmi
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      InstanceType:
+        Ref: DotNETInstanceType
+      SecurityGroups:
+        - Ref: WebServerSecurityGroup
+      InstanceMonitoring: true
+      # Powershell script to replace user id, password, DNS name in Web.Config file, and configure x-ray daemon
+      UserData: !Base64
+        Fn::Sub: |
+          <powershell>
+          $SQLSecrets = Get-SECSecretValue -SecretId ${SQLSecrets}
+
+          $secret = $SQLSecrets.SecretString | ConvertFrom-Json
+          $username = $secret.username
+          $password = $secret.password
+
+          $dns = '${ServerInstance.PublicDnsName}'
+
+          # Dynamically populate the Web.Config file with SQL Server DNS name, User Id, and password.
+          ((Get-Content -path C:\inetpub\wwwroot\sampleapp\Web.config -Raw) -replace 'USER_PASS', $password) -replace 'DNS_NAME', $dns -replace 'USER_ID', $username | Set-Content -path C:\inetpub\wwwroot\sampleapp\Web.config
+
+          # Install and run X-ray Daemon
+          if ( Get-Service "AWSXRayDaemon" -ErrorAction SilentlyContinue ){
+            sc.exe stop AWSXRayDaemon
+            sc.exe delete AWSXRayDaemon
+          }
+          if ( Get-Item -path aws-xray-daemon -ErrorAction SilentlyContinue ) {
+            Remove-Item -Recurse -Force aws-xray-daemon
+          }
+
+          $currentLocation = Get-Location
+          $zipFileName = "aws-xray-daemon-windows-service-3.x.zip"
+          $zipPath = "$currentLocation\$zipFileName"
+          $destPath = "$currentLocation\aws-xray-daemon"
+          $daemonPath = "$destPath\xray.exe"
+          $daemonLogPath = "C:\inetpub\wwwroot\xray-daemon.log"
+          $url = "https://s3.dualstack.us-west-2.amazonaws.com/aws-xray-assets.us-west-2/xray-daemon/aws-xray-daemon-windows-service-3.x.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          Add-Type -Assembly "System.IO.Compression.Filesystem"
+          [io.compression.zipfile]::ExtractToDirectory($zipPath, $destPath)
+
+          sc.exe create AWSXRayDaemon binPath= "$daemonPath -f $daemonLogPath"
+          sc.exe start AWSXRayDaemon
+          </powershell>
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: EC2Role
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EC2AdventureWorksSecretManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  Ref: SQLSecrets
+  SQLSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Secrets manager for Application Insights test application.
+      SecretString: !Sub '{ "username" : "${SQLUser}", "password" : "${SQLUserPassword}"}'
+
+  ### Security Groups ###
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'AdventureWorks application web server security group.'
+      VpcId:
+        Ref: AdventureWorksVpc
+
+  SQLServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'AdventureWorks SQL Server database security group.'
+      VpcId:
+        Ref: AdventureWorksVpc
+
+  DatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::GetAtt: SQLServerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 1433
+      ToPort: 1433
+      SourceSecurityGroupId:
+        Fn::GetAtt: WebServerSecurityGroup.GroupId
+
+  DatabaseRDPIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::GetAtt: SQLServerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3389
+      ToPort: 3389
+      CidrIp:
+        Ref: DefaultRDPIngress
+
+  WebServerHTTPIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::GetAtt: WebServerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+
+  WebServerRDPIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId:
+        Fn::GetAtt: WebServerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3389
+      ToPort: 3389
+      CidrIp:
+        Ref: DefaultRDPIngress
+
+  ### Networking ###
+  AdventureWorksVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+
+  AdventureWorksSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/17
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      MapPublicIpOnLaunch: true
+      VpcId:
+        Ref: AdventureWorksVpc
+
+  AdventureWorksSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.128.0/17
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs:
+              Ref: AWS::Region
+      MapPublicIpOnLaunch: true
+      VpcId:
+        Ref: AdventureWorksVpc
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: AdventureWorksRouteTable
+      SubnetId:
+        Ref: AdventureWorksSubnet1
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: AdventureWorksRouteTable
+      SubnetId:
+        Ref: AdventureWorksSubnet2
+
+  AdventureWorksInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: {}
+
+  AdventureWorksVpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId:
+        Ref: AdventureWorksInternetGateway
+      VpcId:
+        Ref: AdventureWorksVpc
+
+  AdventureWorksRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: AdventureWorksVpc
+
+  AdventureWorksRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: AdventureWorksInternetGateway
+      RouteTableId:
+        Ref: AdventureWorksRouteTable
+
+Outputs:
+  WebsiteURL:
+    Description: URL for the AdventureWorks sample application
+    Value: !Join
+      - ''
+      - - 'http://'
+        - !GetAtt
+          - ApplicationLoadBalancer
+          - DNSName
+        - '/sampleapp'
