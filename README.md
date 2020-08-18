@@ -18,7 +18,7 @@ The CloudFormation template contains the following:
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
 
-#####NOTE: This is a sample application to be used for demonstration purposes only.
+##### NOTE: This is a sample application to be used for demonstration purposes only.
 This application was not built to be a legitimate enterprise application. Because of this, there are a few potential concerns we would like for you to be aware of.
 
 * When launching the CloudFormation stack, we give the option for you to provide your own IP to be used for the security group ingress that allows RDP connections to your desktop. If this is not specified, the default is 0.0.0.0/0.
