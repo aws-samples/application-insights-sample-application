@@ -2,10 +2,10 @@ AWSTemplateFormatVersion: '2010-09-09'
 Parameters:
   SQLServerAmi:
     Type: String
-    Default: ami-0001fe9c3fadd96f5
+    Default: ami-097e3f2ded3fd2418
   DotNETAmi:
     Type: String
-    Default: ami-05b4eaa856c6571fa
+    Default: ami-08a84c6a997504859
   SQLServerInstanceType:
     Type: String
     Default: m5.large
