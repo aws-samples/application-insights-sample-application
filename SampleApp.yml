@@ -1,11 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Mappings:
+  AMIIDMap:
+    us-east-1:
+      SQLServerAmi: ami-097e3f2ded3fd2418
+      DotNETAmi: ami-08a84c6a997504859
+    us-west-2:
+      SQLServerAmi: ami-07ca43d8c26d3bfba
+      DotNETAmi: ami-03140ff7c1044c07c
 Parameters:
-  SQLServerAmi:
-    Type: String
-    Default: ami-097e3f2ded3fd2418
-  DotNETAmi:
-    Type: String
-    Default: ami-08a84c6a997504859
   SQLServerInstanceType:
     Type: String
     Default: m5.large
@@ -75,8 +77,7 @@ Resources:
         Ref: EC2KeyName
       IamInstanceProfile:
         Ref: EC2InstanceProfile
-      ImageId:
-        Ref: SQLServerAmi
+      ImageId: !FindInMap [AMIIDMap, !Ref "AWS::Region", SQLServerAmi]
       InstanceType:
         Ref: SQLServerInstanceType
       Monitoring: true
@@ -117,8 +118,7 @@ Resources:
     Properties:
       KeyName:
         Ref: EC2KeyName
-      ImageId:
-        Ref: DotNETAmi
+      ImageId: !FindInMap [AMIIDMap, !Ref "AWS::Region", DotNETAmi]
       IamInstanceProfile:
         Ref: EC2InstanceProfile
       InstanceType:
